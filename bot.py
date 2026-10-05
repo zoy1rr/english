@@ -33,6 +33,7 @@ import threading
 import traceback
 import atexit
 import errno
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -66,7 +67,7 @@ NOVA_API_KEY = (
 AI_MODEL = (
     os.getenv("AI_MODEL", "").strip()
     or os.getenv("GEMINI_MODEL", "").strip()
-    or "gemini-3.5-flash"
+    or "gemini-flash-latest"
 )
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
 DB_NAME = os.getenv("DB_NAME", "").strip()
@@ -83,7 +84,7 @@ def positive_int_setting(name, default, minimum=1, maximum=1000):
     return value
 
 
-AI_TIMEOUT = positive_int_setting("AI_TIMEOUT", 60, 5, 300)
+AI_TIMEOUT = positive_int_setting("AI_TIMEOUT", 30, 5, 300)
 AI_HISTORY_LIMIT = positive_int_setting("AI_HISTORY_LIMIT", 12, 1, 100)
 QUESTIONS_PER_TEST = positive_int_setting("QUESTIONS_PER_TEST", 10, 1, 50)
 MIN_DATABASE_QUESTIONS = positive_int_setting("MIN_DATABASE_QUESTIONS", 39, 1, 10000)
@@ -382,6 +383,10 @@ LEVEL_BUTTONS = {
 # 03. DATABASE
 # =============================================================================
 
+def sentence_key(sentence: str) -> str:
+    return re.sub(r"\W+", " ", sentence.casefold(), flags=re.UNICODE).strip()
+
+
 class Database:
     def __init__(self, path: str):
         self.path = path
@@ -433,6 +438,12 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_questions_topic ON questions(topic);
             CREATE INDEX IF NOT EXISTS idx_questions_level ON questions(level);
 
+            CREATE TABLE IF NOT EXISTS served_questions (
+                sentence_key TEXT PRIMARY KEY,
+                question_id INTEGER UNIQUE NOT NULL,
+                served_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS answers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id INTEGER NOT NULL,
@@ -481,6 +492,18 @@ class Database:
                 value TEXT NOT NULL
             );
             """)
+            previously_answered = conn.execute("""
+                SELECT DISTINCT q.id, q.sentence
+                FROM answers a
+                JOIN questions q ON q.id=a.question_id
+                WHERE a.question_id IS NOT NULL
+            """).fetchall()
+            for row in previously_answered:
+                conn.execute(
+                    "INSERT OR IGNORE INTO served_questions(sentence_key, question_id) "
+                    "VALUES(?, ?)",
+                    (sentence_key(row["sentence"]), row["id"])
+                )
             conn.commit()
             conn.close()
 
@@ -609,6 +632,69 @@ class Database:
             conn.close()
             return question_ids
 
+    def bulk_insert_unique(self, questions: List[Dict[str, Any]]) -> List[int]:
+        with self.lock:
+            conn = self.connect()
+            existing_keys = {
+                sentence_key(row["sentence"])
+                for row in conn.execute("SELECT sentence FROM questions").fetchall()
+            }
+            question_ids = []
+            for question in questions:
+                key = sentence_key(question["sentence"])
+                if not key or key in existing_keys:
+                    continue
+                cursor = conn.execute("""
+                    INSERT INTO questions
+                    (level, topic, sentence, translation, correct_answer,
+                     option1, option2, option3, explanation, difficulty, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    question["level"], question["topic"], question["sentence"],
+                    question["translation"], question["correct_answer"],
+                    question["option1"], question["option2"], question["option3"],
+                    question["explanation"], question.get("difficulty", "medium"),
+                    question.get("source", "database")
+                ))
+                question_ids.append(cursor.lastrowid)
+                existing_keys.add(key)
+            conn.commit()
+            conn.close()
+            return question_ids
+
+    def reserve_questions(
+        self, questions: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        with self.lock:
+            conn = self.connect()
+            reserved = []
+            keys = set()
+            for question in questions:
+                key = sentence_key(question["sentence"])
+                if not key or key in keys:
+                    continue
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO served_questions(sentence_key, question_id) "
+                    "VALUES(?, ?)",
+                    (key, question["id"])
+                )
+                if cursor.rowcount:
+                    keys.add(key)
+                    reserved.append(question)
+            conn.commit()
+            conn.close()
+            return reserved
+
+    def question_sentence_sample(self, limit: int = 40) -> List[str]:
+        with self.lock:
+            conn = self.connect()
+            rows = conn.execute(
+                "SELECT sentence FROM questions ORDER BY id DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+            conn.close()
+            return [row["sentence"] for row in rows]
+
     def meta(self, key: str) -> Optional[str]:
         with self.lock:
             conn = self.connect()
@@ -634,21 +720,41 @@ class Database:
             rows = conn.execute("""
                 SELECT * FROM questions
                 WHERE topic=? AND level=?
+                    AND id NOT IN (SELECT question_id FROM served_questions)
                 ORDER BY RANDOM()
-                LIMIT ?
-            """, (topic, level, limit)).fetchall()
+            """, (topic, level)).fetchall()
+            selected = []
+            seen_keys = set()
 
-            if fallback_to_level and len(rows) < limit:
+            def reserve_rows(candidates):
+                for row in candidates:
+                    if len(selected) >= limit:
+                        break
+                    question = dict(row)
+                    key = sentence_key(question["sentence"])
+                    if not key or key in seen_keys:
+                        continue
+                    cursor = conn.execute(
+                        "INSERT OR IGNORE INTO served_questions(sentence_key, question_id) "
+                        "VALUES(?, ?)",
+                        (key, question["id"])
+                    )
+                    if cursor.rowcount:
+                        seen_keys.add(key)
+                        selected.append(question)
+
+            reserve_rows(rows)
+            if fallback_to_level and len(selected) < limit:
                 fallback_rows = conn.execute("""
                     SELECT * FROM questions
                     WHERE level=? AND topic<>?
+                        AND id NOT IN (SELECT question_id FROM served_questions)
                     ORDER BY RANDOM()
-                    LIMIT ?
-                """, (level, topic, limit - len(rows))).fetchall()
-                rows.extend(fallback_rows)
-
+                """, (level, topic)).fetchall()
+                reserve_rows(fallback_rows)
+            conn.commit()
             conn.close()
-            return [dict(x) for x in rows]
+            return selected
 
     def plan_questions(self, telegram_id: int, topic: str, level: str,
                        limit: int = 3) -> List[Dict[str, Any]]:
@@ -665,6 +771,7 @@ class Database:
                 ) latest ON latest.latest_id=a.id
                 JOIN questions q ON q.id=a.question_id
                 WHERE a.correct=0 AND q.topic=? AND q.level=?
+                    AND q.id NOT IN (SELECT question_id FROM served_questions)
                 ORDER BY a.id DESC
                 LIMIT ?
             """, (telegram_id, topic, level, limit)).fetchall()
@@ -678,7 +785,9 @@ class Database:
             rows = conn.execute(
                 f"""
                 SELECT * FROM questions
-                WHERE level=? AND topic=?{exclusion}
+                WHERE level=? AND topic=?
+                    AND id NOT IN (SELECT question_id FROM served_questions)
+                    {exclusion}
                 ORDER BY RANDOM()
                 LIMIT ?
                 """,
@@ -694,7 +803,9 @@ class Database:
                 rows = conn.execute(
                     f"""
                     SELECT * FROM questions
-                    WHERE level=? AND topic<>?{exclusion}
+                    WHERE level=? AND topic<>?
+                        AND id NOT IN (SELECT question_id FROM served_questions)
+                        {exclusion}
                     ORDER BY RANDOM()
                     LIMIT ?
                     """,
@@ -702,6 +813,11 @@ class Database:
                 ).fetchall()
                 questions.extend(dict(row) for row in rows)
             conn.close()
+            questions = self.reserve_questions(questions)
+            if len(questions) < limit:
+                questions.extend(
+                    self.random_questions(topic, level, limit - len(questions))
+                )
             return questions[:limit]
 
     def study_plan(self, telegram_id: int):
@@ -1474,43 +1590,66 @@ def safe_json(text: str):
                 return None
     return None
 
+class AIStreamUpdateError(RuntimeError):
+    pass
+
+
 class AI:
     @staticmethod
     def online():
         return gemini_client is not None
 
     @staticmethod
-    def call(prompt: str) -> str:
+    def call(prompt: str, on_update=None) -> str:
         if not AI.online():
             raise RuntimeError(
                 "NOVA AI hozircha mavjud emas. .env dagi NOVA_API_KEY va paketlarni tekshiring."
             )
         model_candidates = list(dict.fromkeys((
             AI_MODEL,
-            "gemini-3.5-flash",
-            "gemini-3.5-flash-lite",
-            "gemini-3.1-flash-lite",
             "gemini-flash-latest",
         )))
         failures = []
         for model_name in model_candidates:
             try:
-                response = gemini_client.models.generate_content(
-                    model=model_name,
-                    contents=prompt
-                )
-                text = getattr(response, "text", None)
+                if on_update is None:
+                    response = gemini_client.models.generate_content(
+                        model=model_name,
+                        contents=prompt
+                    )
+                    text = getattr(response, "text", None)
+                else:
+                    chunks = []
+                    for chunk in gemini_client.models.generate_content_stream(
+                        model=model_name,
+                        contents=prompt
+                    ):
+                        piece = getattr(chunk, "text", None)
+                        if piece:
+                            chunks.append(piece)
+                            try:
+                                on_update(strip_markdown("".join(chunks)))
+                            except Exception as exc:
+                                raise AIStreamUpdateError from exc
+                    text = "".join(chunks)
                 if not text or not text.strip():
                     raise RuntimeError("NOVA AI bo'sh javob qaytardi.")
                 if model_name != AI_MODEL:
                     logger.info("NOVA AI zaxira modeli ishladi.")
                 return strip_markdown(text)
+            except AIStreamUpdateError:
+                raise
             except Exception as exc:
                 failures.append(type(exc).__name__)
                 logger.warning(
                     "NOVA AI request failed for one configured model (%s).",
                     type(exc).__name__
                 )
+                if on_update is not None:
+                    try:
+                        on_update("")
+                    except Exception as update_exc:
+                        raise AIStreamUpdateError from update_exc
 
         logger.error(
             "NOVA AI request failed for every configured model (%s attempts).",
@@ -1521,7 +1660,7 @@ class AI:
         ) from None
 
     @staticmethod
-    def teacher(telegram_id: int, user_message: str) -> str:
+    def teacher(telegram_id: int, user_message: str, on_update=None) -> str:
         user = db.user(telegram_id)
         stats = db.stats(telegram_id)
         history = db.ai_history(telegram_id, AI_HISTORY_LIMIT)
@@ -1569,7 +1708,7 @@ Recent conversation:
 Student message:
 {user_message}
 """
-        return AI.call(prompt)
+        return AI.call(prompt, on_update=on_update)
 
     @staticmethod
     def explain(topic: str, level: str) -> str:
@@ -1621,14 +1760,23 @@ answer and works naturally, accept it.
         )
 
     @staticmethod
-    def generate_questions(level: str, topic: str, amount: int = 10):
+    def generate_questions(
+        level: str, topic: str, amount: int = 10,
+        avoid_sentences: Optional[List[str]] = None
+    ):
         amount = max(3, min(amount, 30))
+        excluded_sentences = list(dict.fromkeys(avoid_sentences or []))
+        avoid_text = "\n".join(f"- {sentence}" for sentence in excluded_sentences)
         prompt = f"""
 You are NOVA AI, a careful bilingual English teacher and question writer.
 Create exactly {amount} original, accurate, useful questions.
 
 Student level: {level}
 Grammar/vocabulary topic: {topic}
+
+Never reuse any English sentence from this previous-question list:
+{avoid_text or "- (no examples provided)"}
+Every new sentence must use a different real-life situation and wording.
 
 Every question MUST describe a meaningful, plausible real-life situation.
 Do not use trivial templates such as "I am happy", disconnected phrases,
@@ -1673,6 +1821,7 @@ Rules:
             return []
 
         result = []
+        seen_sentences = set()
         for item in data:
             if not isinstance(item, dict):
                 continue
@@ -1692,6 +1841,10 @@ Rules:
                 continue
             if str(item.get("difficulty", "")).lower() not in {"easy", "medium", "hard"}:
                 continue
+            key = sentence_key(str(item["sentence"]))
+            if not key or key in seen_sentences:
+                continue
+            seen_sentences.add(key)
             item["level"] = level
             item["topic"] = topic
             item["source"] = "nova_ai"
@@ -1990,18 +2143,38 @@ class KB:
 def esc(value) -> str:
     return html.escape(str(value or ""))
 
+def normalize_menu_text(value):
+    return re.sub(r"[\u200b-\u200d\ufe0e\ufe0f]", "", str(value or "")).strip().casefold()
+
+
+def is_back_button(value):
+    return normalize_menu_text(value) == normalize_menu_text("⬅️ Orqaga")
+
+
+def split_message(text, limit=3500):
+    if limit < 1:
+        raise ValueError("limit must be a positive integer")
+
+    remaining = str(text)
+    chunks = []
+    while len(remaining) > limit:
+        split_at = max(
+            remaining.rfind("\n", 0, limit),
+            remaining.rfind(" ", 0, limit)
+        )
+        if split_at < 1:
+            split_at = limit
+        else:
+            split_at += 1
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+    chunks.append(remaining)
+    return chunks
+
 def send(chat_id, text, markup=None):
     # Plain-text AI responses are intentionally sent without Telegram HTML
     # parsing so AI cannot break messages with malformed tags.
-    remaining = str(text)
-    chunks = []
-    while len(remaining) > 3500:
-        split_at = max(remaining.rfind("\n", 0, 3500), remaining.rfind(" ", 0, 3500))
-        if split_at < 1:
-            split_at = 3500
-        chunks.append(remaining[:split_at])
-        remaining = remaining[split_at:].lstrip()
-    chunks.append(remaining)
+    chunks = split_message(text)
     for index, chunk in enumerate(chunks):
         bot.send_message(
             chat_id,
@@ -2044,11 +2217,14 @@ def start_test(user_id, mode="test"):
             )
             bot.send_chat_action(user_id, "typing")
             generated = AI.generate_questions(
-                s.level, s.topic, QUESTIONS_PER_TEST
+                s.level,
+                s.topic,
+                QUESTIONS_PER_TEST,
+                avoid_sentences=db.question_sentence_sample()
             )
             if generated:
-                question_ids = db.bulk_insert(generated)
-                qs = db.questions_by_ids(question_ids)
+                question_ids = db.bulk_insert_unique(generated)
+                qs = db.reserve_questions(db.questions_by_ids(question_ids))
             if qs:
                 logger.info(
                     "NOVA AI prepared %s questions for %s",
@@ -2062,19 +2238,25 @@ def start_test(user_id, mode="test"):
                 "Mavjud sifatli savollar bilan davom etishga urinaman."
             )
 
-    if len(qs) < min(3, QUESTIONS_PER_TEST):
-        qs = db.random_questions(
-            s.topic, s.level, QUESTIONS_PER_TEST, fallback_to_level=False
-        )
+    if len(qs) < QUESTIONS_PER_TEST:
+        qs.extend(db.random_questions(
+            s.topic,
+            s.level,
+            QUESTIONS_PER_TEST - len(qs),
+            fallback_to_level=False
+        ))
     used_level_fallback = False
-    if not qs:
-        qs = db.random_questions(s.topic, s.level, QUESTIONS_PER_TEST)
-        used_level_fallback = bool(qs)
+    if len(qs) < QUESTIONS_PER_TEST:
+        fallback = db.random_questions(
+            s.topic, s.level, QUESTIONS_PER_TEST - len(qs)
+        )
+        qs.extend(fallback)
+        used_level_fallback = bool(fallback)
     if not qs:
         send(
             user_id,
-            "⚠️ Bu mavzu uchun savol topilmadi. NOVA AI ham hozir javob bermadi; "
-            "bir ozdan so'ng qayta urinib ko'ring."
+            "⚠️ Takrorlanmagan savollar qolmadi va NOVA AI yangi savol "
+            "tayyorlay olmadi. Birozdan so'ng qayta urinib ko'ring."
         )
         return
     if used_level_fallback:
@@ -2086,7 +2268,7 @@ def start_test(user_id, mode="test"):
     if len(qs) < QUESTIONS_PER_TEST:
         send(
             user_id,
-            f"ℹ️ Hozircha {len(qs)} ta sifatli savol mavjud; "
+            f"ℹ️ Takrorlanmagan {len(qs)} ta savol mavjud; "
             "mashq shu savollar bilan yakunlanadi."
         )
 
@@ -2258,6 +2440,58 @@ def cancel_handler(message):
     reset_session(uid)
     send(uid, "⏹️ Joriy amal bekor qilindi.", KB.main(uid))
 
+@bot.message_handler(func=lambda m: is_back_button(m.text))
+def back_handler(message):
+    uid = message.from_user.id
+    s = get_session(uid)
+
+    if s.state in ("TEST", "WRITTEN"):
+        is_study_plan = s.mode == "study_plan"
+        s.state = "MAIN" if is_study_plan else "TOPIC_ACTIONS"
+        s.questions = []
+        s.index = 0
+        s.waiting_written = False
+        s.answered_current = False
+        markup = KB.main(uid) if is_study_plan else KB.topic_actions()
+        send(uid, "⏹️ Joriy mashq to'xtatildi.", markup)
+        return
+
+    if s.state == "TOPICS":
+        s.state = "LEVELS"
+        send(uid, "📚 Darajani tanlang:", KB.levels())
+        return
+
+    if s.state == "TOPIC_ACTIONS":
+        s.state = "TOPICS" if s.level else "LEVELS"
+        markup = KB.topics(s.level) if s.level else KB.levels()
+        send(uid, "📚 Mavzu tanlang:" if s.level else "📚 Darajani tanlang:", markup)
+        return
+
+    if s.state == "REMINDER_TIME":
+        s.state = "REMINDER"
+        show_reminder_settings(uid)
+        return
+
+    if s.state == "REMINDER":
+        s.state = "SETTINGS"
+        send(uid, "⚙️ Sozlamalar:", KB.settings())
+        return
+
+    if s.state == "PROFILE":
+        s.state = "SETTINGS"
+        send(uid, "⚙️ Sozlamalar:", KB.settings())
+        return
+
+    if s.state == "AI" and s.ai_topic and s.topic and s.level:
+        s.state = "TOPIC_ACTIONS"
+        s.ai_topic = None
+        send(uid, "📚 Mavzu menyusiga qaytdingiz.", KB.topic_actions())
+        return
+
+    s.state = "MAIN"
+    s.ai_topic = None
+    send(uid, "🏠 Asosiy menyu:", KB.main(uid))
+
 @bot.message_handler(func=lambda m: m.text == "📚 Mavzular")
 def menu_topics(message):
     uid = message.from_user.id
@@ -2287,6 +2521,7 @@ def menu_ai(message):
     uid = message.from_user.id
     s = get_session(uid)
     s.state = "AI"
+    s.ai_topic = None
     send(
         uid,
         "🤖💬 NOVA AI ISHLAYAPTI!\n\n"
@@ -2306,6 +2541,7 @@ def menu_ai(message):
 @bot.message_handler(func=lambda m: m.text == "📊 Natijalarim")
 def menu_results(message):
     uid = message.from_user.id
+    get_session(uid).state = "RESULTS"
     st = db.stats(uid)
     u = st["user"]
     if not u:
@@ -2334,6 +2570,7 @@ def menu_results(message):
 @bot.message_handler(func=lambda m: m.text == "🔥 Streak")
 def menu_streak(message):
     uid = message.from_user.id
+    get_session(uid).state = "RESULTS"
     u = db.user(uid)
     streak = u["streak"] if u else 0
     send(
@@ -2348,6 +2585,7 @@ def menu_streak(message):
 @bot.message_handler(func=lambda m: m.text == "🏆 Reyting")
 def menu_ranking(message):
     uid = message.from_user.id
+    get_session(uid).state = "RESULTS"
     rows = db.leaderboard(10)
     rank = db.rank(uid)
     medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
@@ -2370,6 +2608,7 @@ def tashkent_now():
     return datetime.now(timezone(timedelta(hours=5)))
 
 def show_study_plan(user_id):
+    get_session(user_id).state = "STUDY_PLAN"
     plan = db.study_plan(user_id)
     stats = db.stats(user_id)
     topic = stats["weak"]["topic"] if stats["weak"] else "🟢 Present Simple"
@@ -2386,7 +2625,7 @@ def show_study_plan(user_id):
         f"📅 SHAXSIY KUNLIK REJA\n\n"
         f"⏱ Kuniga 5 daqiqa · 3 ta savol\n"
         f"📚 Bugungi mavzu: {topic}\n"
-        f"🔁 Avval oldingi xatolar takrorlanadi.\n"
+        f"🔁 Hali ishlatilmagan oldingi xatolar birinchi chiqadi.\n"
         f"{status}\n"
         f"{reminder}\n\n"
         "Reja natijalaringizga qarab zaifroq mavzuni tanlaydi.",
@@ -2436,12 +2675,13 @@ def start_daily_plan(user_id):
         user_id,
         f"🚀 Bugungi 5 daqiqalik reja boshlandi!\n"
         f"📚 Mavzu: {topic}\n"
-        f"🔁 Oldingi xatolaringiz bo'lsa, avval shu savollar chiqadi."
+        f"🔁 Ishlatilmagan eski xatolaringiz bo'lsa, avval shu savollar chiqadi."
     )
     show_question(user_id)
 
 @bot.message_handler(func=lambda m: m.text == "❓ Yordam")
 def menu_help_button(message):
+    get_session(message.from_user.id).state = "HELP"
     help_handler(message)
 
 @bot.message_handler(func=lambda m: m.text == "📅 Kunlik reja")
@@ -2484,10 +2724,6 @@ def request_reminder_time(message):
 @bot.message_handler(func=lambda m: get_session(m.from_user.id).state == "REMINDER_TIME")
 def set_reminder_time(message):
     uid = message.from_user.id
-    if message.text == "⬅️ Orqaga":
-        get_session(uid).state = "REMINDER"
-        show_reminder_settings(uid)
-        return
     if not message.text:
         send(uid, "Vaqtni HH:MM ko'rinishida yozing, masalan 19:30.")
         return
@@ -2535,12 +2771,15 @@ def random_ai_topic(message):
     s.state = "TOPIC_ACTIONS"
     show_topic_actions(uid)
 
-@bot.message_handler(func=lambda m: get_session(m.from_user.id).state == "TOPICS")
+@bot.message_handler(
+    func=lambda m: (
+        get_session(m.from_user.id).state == "TOPICS"
+        and not is_back_button(m.text)
+    )
+)
 def choose_topic(message):
     uid = message.from_user.id
     s = get_session(uid)
-    if message.text == "⬅️ Orqaga":
-        return
     if message.text not in LEVELS[s.level]["topics"]:
         send(uid, "⚠️ Iltimos, pastdagi 📚 mavzu tugmalaridan birini tanlang.")
         return
@@ -2624,10 +2863,18 @@ def ai_new_questions(message):
         if not generated:
             send(uid, "⚠️ AI savol yaratmadi. 🔄 Qayta urinib ko'ring.")
             return
-        db.bulk_insert(generated)
+        question_ids = db.bulk_insert_unique(generated)
+        if not question_ids:
+            send(
+                uid,
+                "ℹ️ AI faqat avval yaratilgan gaplarni taklif qildi. "
+                "🔄 Yana urinib ko'ring.",
+                KB.topic_actions()
+            )
+            return
         send(
             uid,
-            f"🎉🤖 AI {len(generated)} ta yangi savol yaratdi!\n\n"
+            f"🎉🤖 AI {len(question_ids)} ta yangi savol yaratdi!\n\n"
             f"📚 Mavzu: {s.topic}\n"
             f"💾 Savollar bazaga saqlandi.\n\n"
             f"📝 Endi yangi testni boshlashingiz mumkin.",
@@ -2783,11 +3030,6 @@ def normalize_answer(value):
 def written_answer(message):
     uid = message.from_user.id
     s = get_session(uid)
-    if message.text == "⬅️ Orqaga":
-        s.state = "TOPIC_ACTIONS"
-        s.waiting_written = False
-        send(uid, "⬅️ Mavzu menyusiga qaytdingiz.", KB.topic_actions())
-        return
 
     if not message.text:
         send(uid, "✍️ Iltimos, javobni matn ko'rinishida yuboring.")
@@ -2860,12 +3102,6 @@ def written_answer(message):
 @bot.message_handler(func=lambda m: get_session(m.from_user.id).state == "AI")
 def ai_message(message):
     uid = message.from_user.id
-    s = get_session(uid)
-
-    if message.text == "⬅️ Orqaga":
-        s.state = "MAIN"
-        send(uid, "🏠 Asosiy menyuga qaytdingiz.", KB.main(uid))
-        return
 
     if message.text == "🧹 AI tarixini tozalash":
         db.clear_ai(uid)
@@ -2895,14 +3131,44 @@ def ai_message(message):
     try:
         bot.send_chat_action(uid, "typing")
         db.save_ai(uid, "user", user_text)
-        answer = AI.teacher(uid, user_text)
-        db.save_ai(uid, "assistant", answer)
+        prefix = "🤖✨ NOVA AI:\n\n"
+        placeholder = f"{prefix}✍️ Yozmoqda..."
+        progress_message = bot.send_message(uid, placeholder)
+        last_update = 0.0
+        last_visible = placeholder
 
-        send(
-            uid,
-            f"🤖✨ NOVA AI:\n\n{answer}",
-            KB.ai()
-        )
+        def update_stream(text, force=False):
+            nonlocal last_update, last_visible
+            now = time.monotonic()
+            if not force and text and now - last_update < 1.1:
+                return
+
+            current_text = f"{prefix}{text.strip() or '✍️ Yozmoqda...'}"
+            chunks = split_message(current_text)
+            visible_text = chunks[0]
+            if visible_text != last_visible or force:
+                bot.edit_message_text(
+                    visible_text,
+                    uid,
+                    progress_message.message_id,
+                    reply_markup=KB.ai() if force and len(chunks) == 1 else None
+                )
+                last_visible = visible_text
+                last_update = now
+
+            if force:
+                for index, chunk in enumerate(chunks[1:]):
+                    bot.send_message(
+                        uid,
+                        chunk,
+                        reply_markup=(
+                            KB.ai() if index == len(chunks[1:]) - 1 else None
+                        )
+                    )
+
+        answer = AI.teacher(uid, user_text, on_update=update_stream)
+        db.save_ai(uid, "assistant", answer)
+        update_stream(answer, force=True)
     except Exception as exc:
         logger.exception("AI chat error")
         send(
@@ -2927,6 +3193,7 @@ def clear_ai_main(message):
 @bot.message_handler(func=lambda m: m.text == "👤 Profil")
 def profile(message):
     uid = message.from_user.id
+    get_session(uid).state = "PROFILE"
     st = db.stats(uid)
     u = st["user"]
     if not u:
@@ -2954,6 +3221,7 @@ def profile(message):
 @bot.message_handler(func=lambda m: m.text == "🎯 Darajam")
 def my_level(message):
     uid = message.from_user.id
+    get_session(uid).state = "PROFILE"
     u = db.user(uid)
     xp = u["xp"] if u else 0
     lvl = u["level"] if u else 1
@@ -3066,8 +3334,11 @@ def admin_generate(message):
     try:
         generated = AI.generate_questions(level, topic, 10)
         if generated:
-            db.bulk_insert(generated)
-            send(ADMIN_ID, f"✅🤖 {len(generated)} ta AI savol bazaga qo'shildi.", KB.admin())
+            question_ids = db.bulk_insert_unique(generated)
+            if question_ids:
+                send(ADMIN_ID, f"✅🤖 {len(question_ids)} ta yangi AI savol bazaga qo'shildi.", KB.admin())
+            else:
+                send(ADMIN_ID, "ℹ️ Yangi, takrorlanmagan AI savol topilmadi.", KB.admin())
         else:
             send(ADMIN_ID, "⚠️ AI savol yaratmadi.", KB.admin())
     except Exception as exc:
@@ -3084,49 +3355,6 @@ def admin_broadcast_info(message):
         "broadcast alohida buyruq orqali bajariladi.",
         KB.admin()
     )
-
-
-# =============================================================================
-# 17. UNIVERSAL BACK
-# =============================================================================
-
-@bot.message_handler(func=lambda m: m.text == "⬅️ Orqaga")
-def back_handler(message):
-    uid = message.from_user.id
-    s = get_session(uid)
-
-    if s.state in ("TEST", "WRITTEN"):
-        is_study_plan = s.mode == "study_plan"
-        s.state = "MAIN" if is_study_plan else "TOPIC_ACTIONS"
-        s.questions = []
-        s.index = 0
-        s.waiting_written = False
-        markup = KB.main(uid) if is_study_plan else KB.topic_actions()
-        send(uid, "⏹️ Joriy mashq to'xtatildi.", markup)
-        return
-
-    if s.state == "TOPICS":
-        s.state = "LEVELS"
-        send(uid, "📚 Darajani tanlang:", KB.levels())
-        return
-
-    if s.state in (
-        "LEVELS", "AI", "SETTINGS", "RESULTS", "ADMIN",
-        "REMINDER", "REMINDER_TIME"
-    ):
-        s.state = "MAIN"
-        send(uid, "🏠 Asosiy menyu:", KB.main(uid))
-        return
-
-    if s.state == "TOPIC_ACTIONS":
-        s.state = "TOPICS"
-        if s.level:
-            send(uid, f"📚 {level_title(s.level)} mavzulari:", KB.topics(s.level))
-        else:
-            send(uid, "📚 Darajani tanlang:", KB.levels())
-        return
-
-    send(uid, "🏠 Asosiy menyu:", KB.main(uid))
 
 
 # =============================================================================

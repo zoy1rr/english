@@ -13,6 +13,14 @@
 
    Botni to'xtatish uchun `Ctrl+C` bosing. Bir token bilan bir vaqtda faqat bitta polling jarayoni ishlashi kerak.
 
+## Testlarni ishga tushirish
+
+Botning avtomatik testlari Telegram tokeni yoki NOVA AI kalitini talab qilmaydi. Loyiha papkasida quyidagini bajaring:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
 ## Railway hosting
 
 1. Loyihani GitHub repozitoriyga yuklang. `.env` va SQLite baza fayllarini repozitoriyga qo'shmang.
@@ -43,9 +51,11 @@ Ishga tushganda bot `/start`, `/help`, `/cancel`, `/id` buyruqlarini Telegram me
 ## Ishlash va saqlash
 
 - Birinchi ishga tushishda mazmunli offline savollar bazaga qo'shiladi; avvalgi noto'g'ri avtomatik ko'chirmalar yangi savol bankiga almashtiriladi.
-- Har bir test yoki yozma mashq uchun NOVA AI tanlangan mavzuga mos kontekstli gaplarni va ularning ravon o'zbekcha tarjimasini yaratadi. AI vaqtincha ishlamasa, bot mavjud offline savollardan foydalanishga urinadi va bu haqda bildiradi.
-- NOVA AI suhbatda foydalanuvchi yozgan tilda javob beradi va odatda qisqa, tushunarli javob qaytaradi.
-- `📅 Kunlik reja` har kuni 5 daqiqalik, 3 savolli umumiy ingliz tili mashqini beradi. Imkon qadar avval oxirgi urinishda xato bo'lgan savollar qayta beriladi, qolgan savollar foydalanuvchining ko'proq qiynalayotgan mavzusidan tanlanadi.
+- Har bir test yoki yozma mashq uchun NOVA AI tanlangan mavzuga mos kontekstli gaplarni va ularning ravon o'zbekcha tarjimasini yaratadi. AI vaqtincha ishlamasa, bot avval ishlatilmagan offline savollardan foydalanadi va bu haqda bildiradi.
+- Testda ko'rsatilgan gaplar qayta ishlatilmaydi; yangi AI gaplari ham bazadagi oldingi gaplar bilan solishtirilib, takrorlari saqlanmaydi. Yangi, takrorlanmagan savollar qolmasa, bot eski savolni qaytarmaydi.
+- NOVA AI suhbatda foydalanuvchi yozgan tilda javob beradi va odatda qisqa, tushunarli javob qaytaradi. Javob yozilayotgan paytda bot xabarni real vaqtda yangilab boradi.
+- `⬅️ Orqaga` har bir menyu holatida oldingi bo'limga qaytaradi; test/yozma mashqni to'xtatadi, eslatma va profil oynalaridan esa tegishli sozlamalar menyusiga olib boradi.
+- `📅 Kunlik reja` har kuni 5 daqiqalik, 3 savolli umumiy ingliz tili mashqini beradi. Hali ishlatilmagan, avval xato qilingan savollar birinchi tanlanadi; qolganlari foydalanuvchining ko'proq qiynalayotgan mavzusidan olinadi.
 - `⚙️ Sozlamalar` → `⏰ Kunlik eslatma` orqali eslatmani ixtiyoriy yoqib, vaqtini `HH:MM` ko'rinishida tanlash mumkin. Eslatma sukut bo'yicha o'chiq va Toshkent vaqti (UTC+5) bo'yicha yuboriladi.
 - SQLite ma'lumotlar bazasi `DB_NAME` bilan belgilanadi; standart fayl `english_academy.db` bo'lib loyiha papkasida yaratiladi.
 - Bot webhook o'rnatilgan bo'lsa, polling boshlashdan oldin webhookni pending xabarlarni tashlamasdan o'chiradi.
@@ -59,9 +69,9 @@ Ishga tushganda bot `/start`, `/help`, `/cancel`, `/id` buyruqlarini Telegram me
 - `BOT_TOKEN` — BotFather bergan token
 - `ADMIN_ID` — Telegram raqamli foydalanuvchi ID
 - `NOVA_API_KEY` — NOVA AI xizmatiga kirish kaliti. Oldingi sozlamalar uchun `GEMINI_API_KEY` nomi ham orqaga moslik sababli qabul qilinadi.
-- `AI_MODEL` — ichki AI model sozlamasi; bo'sh qoldirilsa, bot ishlaydigan modelni o'zi tanlaydi.
+- `AI_MODEL` — AI modeli; bo'sh qoldirilsa, tezkor `gemini-flash-latest` modeli ishlatiladi. So'rovda sozlangan model va bitta tezkor zaxira model sinab ko'riladi.
 - `DB_NAME` — SQLite fayl nomi yoki to'liq yo'li; bo'sh bo'lsa Railway volume yo'li avtomatik, aks holda loyiha papkasi ishlatiladi
-- `AI_TIMEOUT` — AI so'rovi kutish vaqti, soniyada (5–300)
+- `AI_TIMEOUT` — AI so'rovi kutish vaqti, soniyada (5–300; standart 30)
 - `AI_HISTORY_LIMIT` — AI suhbat tarixidagi xabarlar soni (1–100)
 - `QUESTIONS_PER_TEST` — testdagi savollar soni (1–50)
 - `MIN_DATABASE_QUESTIONS` — minimal offline savollar soni (1–10000)
